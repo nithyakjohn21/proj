@@ -1,0 +1,237 @@
+import time
+import serial
+import datetime as dt
+import numpy as np
+from numpy import trapz
+import matplotlib.pyplot as plt
+from scipy import signal
+from sklearn import preprocessing
+from sklearn.neural_network import MLPClassifier
+
+
+class ApneaDiagnose():
+
+    def __init__(self, file_name, segment_size=20, sensor_num=4, start_range=0, end_range=-1, step=1):
+        self.filename = file_name
+        self.segment_size = segment_size
+        self.sensor_num = sensor_num
+        self.start_range = start_range
+        self.end_range = end_range
+        self.graph_value = np.array([])
+        self.time_value = np.array([])
+        self.fun_array = [self.autocorrelation, self.standard_deviation, self.tenth_perc, self.ninetith_perc, self.area_under_curve]
+        self.step = step
+
+    def capturedat(self):
+        # A function to capture data from Arduino via Serial Port and write to csv file with name specified as argument
+        ser = serial.Serial('/dev/ttyUSB0', 9600, timeout=None)
+        while(True):
+            vals = ser.readline().decode("utf-8").splitlines()
+            senvalarr = str(vals[0]).split(",")
+            tim = str(dt.datetime.timestamp(dt.datetime.now()))
+            with open("datafiles/"+self.filename, "a") as csvfile:
+                csvfile.write(tim)
+                for i in range(0, self.sensor_num):
+                    csvfile.write(","+senvalarr[i])
+                csvfile.write("\n")
+            time.sleep(0.1)
+            print("Writing..."+tim, end="")
+            for i in range(0, self.sensor_num):
+                print(","+senvalarr[i], end="")
+            print("")
+
+    def process_to_features(self):
+        # A function that Automatically Calls filtering function and generaters to Extract features from filtered value, plot them And write the features along side time into a csv file
+        self.merge_filter()
+        feat_arr = dict()
+        feat_arr_pre = dict()
+        for funcs in self.fun_array:
+            feat_arr[funcs] = [x for x in funcs()]
+            feat_arr_pre[funcs] = preprocessing.minmax_scale(feat_arr[funcs], feature_range=(-1, 1))
+            length = len(feat_arr[funcs])
+        with open("datafiles/features/"+self.filename, "w") as csvfile:
+            for i in range(0, length):
+                for fun_name in feat_arr_pre.keys():
+                    csvfile.write(str(feat_arr_pre[fun_name][i])+",")
+                csvfile.write("\n")
+        # with open("datafiles/train/checkp.csv", "a") as testfile:
+        #     for i in range(0, length):
+        #         # if (feat_arr_pre[self.fun_array[1]][i] < -0.8):
+        #         for fun_name in feat_arr_pre.keys():
+        #             testfile.write(str(feat_arr_pre[fun_name][i])+",")
+        #         testfile.write("2\n")
+        # with open("datafiles/train/checkpws.csv", "a") as testfile:
+        #     for i in range(0, length):
+        #         # if (feat_arr_pre[self.fun_array[1]][i] < -0.8):
+        #         for fun_name in feat_arr_pre.keys():
+        #             testfile.write(str(feat_arr_pre[fun_name][i])+" ")
+        #         testfile.write("2\n")
+        feats = len(feat_arr_pre)
+        fig = plt.figure(figsize=(16, 12), dpi=120)
+        fig.subplots_adjust(left=0.05, right=0.98, bottom=0.05, top=0.98, hspace=0.24)
+        for num, keys in enumerate(feat_arr_pre.keys()):
+            subnum = (feats*100)+10+num+1
+            plt.subplot(subnum)
+            plt.plot(feat_arr_pre[keys])
+        plt.xlabel("Time")
+        plt.savefig("graph/"+self.filename[:-4]+"_features.png", format="png", dpi=120)
+        plt.show()
+
+    def plot_feature(self, gen_feat):
+        # A Function used for plotting each feature scaled to min max (-1,1), passed in a generatorfunction it will plot the values against time.
+        feat = np.array([x for x in gen_feat()])
+        featpre = preprocessing.minmax_scale(feat, feature_range=(-1, 1))
+        figs = plt.figure(figsize=(16, 12), dpi=120)
+        figs.subplots_adjust(left=0.05, right=0.98, bottom=0.1, top=0.9)
+        plt.xlabel("Time")
+        plt.ylabel(gen_feat.__name__+" Scaled")
+        plt.plot(self.time_value[1:-self.segment_size], featpre)
+        plt.show()
+
+    def plot_feature_choice(self):
+        # Interface for plotting features individually
+        for num, funcs in enumerate(self.fun_array):
+            print(str(num+1)+" - "+funcs.__name__)
+        choice = int(input("Enter \n"))-1
+        self.plot_feature(self.fun_array[choice])
+
+    def merge_filter(self):
+        # A function to merge the data from 4 sensors by averaging and filter the result to get a single value against time resulting in a single graph representing all the sensors
+        avg_sen = np.array([])
+        with open("datafiles/"+self.filename, "r") as csvfile:
+            datavals = csvfile.read().splitlines()
+        datavals = datavals[self.start_range: self.end_range]
+        subtim = datavals[0].split(",")[0]
+        for lines in datavals:
+            vel = [float(i) for i in lines.split(",")]
+            self.time_value = np.append(self.time_value, [vel.pop(0) - float(subtim)])
+            avgval = sum(vel)/self.sensor_num
+            avg_sen = np.append(avg_sen, avgval)
+        b, a = signal.butter(10, 0.15, 'low')
+        self.graph_value = signal.filtfilt(b, a, avg_sen)
+        with open("datafiles/filtered/"+self.filename, "w") as csvfile:
+            for a, b in zip(self.time_value, self.graph_value):
+                csvfile.write(str(a)+","+str(b)+"\n")
+        fig = plt.figure(figsize=(16, 12), dpi=100)
+        fig.subplots_adjust(left=0.05, right=0.98, bottom=0.1, top=0.9)
+        plt.xlabel("Time")
+        plt.ylabel("Pressure")
+        plt.plot(self.time_value, self.graph_value)
+        plt.savefig("graph/"+self.filename[:-4]+".png", dpi=120, format="png")
+        plt.show()
+
+    def segment_analyse(self):
+        # A Generator function to get overlapped subsegments obtained from the filtered data
+        for i in range(1, len(self.graph_value) - self.segment_size, self.step):
+            yield (self.graph_value[i: i+self.segment_size])
+
+    def autocorrelation(self):
+        # function that displays auto correlation of each segment of given dataset
+        res = np.array([])
+        for valset in self.segment_analyse():
+            res = np.correlate(valset, valset, mode='full')
+            yield (res.max())
+
+    def samplespersec(self):
+        # function that displays samples per second of each segment of given dataset
+        arr = self.time_value[1:-(self.segment_size)]
+        count = 0
+        for i in arr:
+            if (i-arr[0] < 1):
+                count += 1
+            else:
+                return count
+
+    def standard_deviation(self):
+        # function that displays standard deviation of each segment of given dataset
+        std_dev = []
+        for valset in self.segment_analyse():
+            std_dev.append(np.std(valset))
+            yield (np.std(valset))
+
+    def tenth_perc(self):
+        # function that displays tenth percentile value of each segment of given dataset
+        for valset in self.segment_analyse():
+            vals = valset
+            tenth = len(vals) * 10 // 100
+            yield(vals[tenth])
+
+    def ninetith_perc(self):
+        # function that displays ninetieth percentile value of each segment of given dataset
+        for valset in self.segment_analyse():
+            vals = valset
+            ninetieth = len(vals) * 90 // 100
+            yield(vals[ninetieth])
+
+    def area_under_curve(self):
+        # function that calculates the area under the curve of each segment of given data set by integration with trapezium rule
+        for valset in self.segment_analyse():
+            yield trapz(valset, dx=0.2)
+
+
+class CheckApneaIndex():
+
+    def __init__(self, file_name, segment_size=40, feature_num=5):
+        self.file_name = file_name
+        self.segment_size = segment_size
+        self.reference = np.array([])
+        self.feature_num = feature_num
+
+    def feature_process(self):
+        feature_vals = dict()
+        with open("datafiles/features/"+self.file_name) as featfile:
+            datavals = featfile.read().splitlines()
+        for nums in range(0, self.feature_num):
+            feature_vals[nums] = []
+        clf = self.get_classifier()
+        # answer = []
+        count = 0
+        prev_ans = 1
+        curr_ans = 0
+        for lines in datavals:
+            vals = lines.split(",")
+            arr = []
+            for a in vals:
+                if a:
+                    arr.append(float(a))
+            # answer.append(clf.predict([arr])[0])
+            curr_ans = clf.predict([arr])[0]
+            if(curr_ans == 2 and prev_ans == 1):
+                count += 1
+            prev_ans = curr_ans
+        print(count)
+        # print(answer)
+        # for ans in answer:
+
+    def get_classifier(self):
+        hitarr = []
+        missarr = []
+        with open("datafiles/train/test3/hit.csv") as hitfile:
+            hits = hitfile.read().splitlines()
+        for lines in hits:
+            vals = lines.split(",")
+            arr = []
+            for a in vals:
+                if a:
+                    arr.append(float(a))
+            hitarr.append(arr)
+        with open("datafiles/train/test3/miss.csv") as missfile:
+            miss = missfile.read().splitlines()
+        for lines in miss:
+            vals = lines.split(",")
+            arr = []
+            for a in vals:
+                if a:
+                    arr.append(float(a))
+            missarr.append(arr)
+        hitarr = hitarr
+        missarr = missarr
+        x = (hitarr + missarr)
+        y = []
+        y.append([1 for a in range(0, len(hitarr))])
+        y.append([2 for a in range(0, len(missarr))])
+
+        clf = MLPClassifier(solver='lbfgs', hidden_layer_sizes=(5, 5), alpha=1e-7, random_state=1)
+        clf.fit(x, y[0]+y[1])
+
+        return clf
